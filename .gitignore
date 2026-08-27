@@ -1,0 +1,372 @@
+# ============================================================
+# DATA / PHI / PATIENT DATA
+# ============================================================
+
+# Data directories
+data/
+dataset/
+datasets/
+raw/
+raw_data/
+processed/
+processed_data/
+interim/
+external/
+private/
+phi/
+PHI/
+patients/
+patient_data/
+clinical_data/
+waveforms/
+numerics/
+records/
+
+# Common data files
+*.csv
+*.csv.gz
+*.tsv
+*.tsv.gz
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.hdf
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.mat
+*.sav
+*.dta
+*.sas7bdat
+
+# Medical / waveform formats
+*.hea
+*.dat
+*.atr
+*.ann
+*.edf
+*.bdf
+*.wfdb
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.mdb
+
+# Archives — may contain datasets / PHI
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.7z
+*.rar
+
+
+# ============================================================
+# SECRETS / CREDENTIALS
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+credentials*
+secrets*
+secret*
+token*
+tokens*
+api_key*
+apikey*
+
+.aws/
+.gcp/
+.azure/
+
+# SSH keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+
+# ============================================================
+# MODEL CHECKPOINTS / WEIGHTS
+# ============================================================
+
+checkpoints/
+checkpoint/
+ckpts/
+weights/
+models/
+saved_models/
+
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.tflite
+
+
+# ============================================================
+# EXPERIMENT OUTPUTS / LOGS
+# ============================================================
+
+outputs/
+output/
+results/
+runs/
+experiments/
+artifacts/
+predictions/
+logs/
+log/
+
+*.log
+*.out
+*.err
+
+# TensorBoard
+events.out.tfevents.*
+
+# Weights & Biases
+wandb/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Lightning
+lightning_logs/
+
+
+# ============================================================
+# SLURM / HPC
+# ============================================================
+
+slurm-*.out
+slurm-*.err
+
+*.o[0-9]*
+*.e[0-9]*
+
+job_outputs/
+job_logs/
+
+
+# ============================================================
+# CACHE / TEMPORARY FILES
+# ============================================================
+
+.cache/
+cache/
+tmp/
+temp/
+scratch/
+
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# mypy / ruff / pyright
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+
+# ============================================================
+# PYTHON ENVIRONMENTS
+# ============================================================
+
+.venv/
+venv/
+env/
+ENV/
+
+.conda/
+conda-env/
+
+pip-wheel-metadata/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+
+# ============================================================
+# JUPYTER
+# ============================================================
+
+.ipynb_checkpoints/
+
+# Optional: notebooks frequently contain embedded patient/output data.
+# Uncomment if you do not want ANY notebooks committed.
+# *.ipynb
+
+
+# ============================================================
+# IDE / EDITOR
+# ============================================================
+
+.vscode/
+.idea/
+
+*.code-workspace
+
+# Vim
+*.swp
+*.swo
+
+# Emacs
+*~
+\#*\#
+
+
+# ============================================================
+# OS FILES
+# ============================================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+Thumbs.db
+Desktop.ini
+
+
+# ============================================================
+# LARGE GENERATED FIGURES / MEDIA
+# ============================================================
+
+figures/
+plots/
+visualizations/
+
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.gif
+*.mp4
+*.avi
+*.mov
+
+
+# ============================================================
+# LOCAL CONFIGURATION
+# ============================================================
+
+config.local.*
+configs/local/
+local_config.*
+settings.local.*
+
+
+# ============================================================
+# DOWNLOADS / EXTERNAL REPOSITORIES
+# ============================================================
+
+downloads/
+download/
+third_party_data/
+external_data/
+
+
+# ============================================================
+# MIMIC / CLINICAL DATA SPECIFIC
+# ============================================================
+
+mimic/
+mimic3/
+mimiciii/
+mimic-iii/
+mimic_iv/
+mimic-iv/
+mimic3wdb/
+mimic3wdb-matched/
+
+CHARTEVENTS*
+LABEVENTS*
+INPUTEVENTS*
+OUTPUTEVENTS*
+PATIENTS*
+ADMISSIONS*
+ICUSTAYS*
+NOTEEVENTS*
+PRESCRIPTIONS*
+PROCEDUREEVENTS*
+DIAGNOSES_ICD*
+D_ITEMS*
+D_LABITEMS*
+
+# WFDB downloaded records / patient directories
+p00*/
+p01*/
+p02*/
+p03*/
+p04*/
+p05*/
+p06*/
+p07*/
+p08*/
+p09*/
+
+
+# ============================================================
+# LOCAL ANALYSIS OUTPUTS
+# ============================================================
+
+*.prof
+*.profile
+*.trace
+
+profiling/
+debug/
+debug_outputs/
+
+
+# ============================================================
+# MAC / LINUX USER-SPECIFIC FILES
+# ============================================================
+
+.directory
+.Trash-*
+.nfs*
