@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
+try:
+    import wfdb
+except ImportError:  # pragma: no cover
+    wfdb = None
 
 
 def normalization_stats_path(waveform_dir: Path, splits_path: Path) -> Path:
@@ -92,6 +98,87 @@ def _load_waveform_metadata(waveform_dir: Path) -> dict:
     return json.loads((Path(waveform_dir) / "metadata.json").read_text())
 
 
+def _is_full_data_anchor_cache(waveform_dir: Path) -> bool:
+    return (Path(waveform_dir) / "anchors.csv").exists()
+
+
+def _load_full_data_train_segments(waveform_dir: Path, split: str) -> list[dict[str, str]]:
+    anchors_path = Path(waveform_dir) / "anchors.csv"
+    if not anchors_path.exists():
+        raise FileNotFoundError(f"Missing full-data anchors file: {anchors_path}")
+    seen: set[str] = set()
+    rows: list[dict[str, str]] = []
+    with open(anchors_path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"segment_id", "segment_path", "split_label"}
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{anchors_path} missing required columns: {sorted(missing)}")
+        for row in reader:
+            if str(row["split_label"]) != split:
+                continue
+            segment_id = str(row["segment_id"])
+            if segment_id in seen:
+                continue
+            seen.add(segment_id)
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No full-data segments found for split={split!r} in {anchors_path}")
+    return rows
+
+
+def _load_full_data_available_channels(waveform_dir: Path) -> tuple[str, ...]:
+    metadata_path = Path(waveform_dir) / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        channels = metadata.get("channel_order") or metadata.get("extraction_config", {}).get("channel_order")
+        if channels:
+            return tuple(str(ch) for ch in channels)
+    return ("II", "ABP", "PLETH", "RESP")
+
+
+def _compute_full_data_segment_channel_stats(
+    waveform_dir: Path,
+    splits_path: Path,
+    channels: Iterable[str] | None,
+    split: str,
+) -> dict:
+    if wfdb is None:
+        raise ImportError("wfdb is required to compute full-data waveform normalization stats")
+    available_channels = _load_full_data_available_channels(waveform_dir)
+    selected_channels = tuple(channels) if channels is not None else available_channels
+    missing = [ch for ch in selected_channels if ch not in available_channels]
+    if missing:
+        raise ValueError(
+            f"Requested channels {missing} not available in {waveform_dir}. "
+            f"Available: {available_channels}"
+        )
+    moments = {ch: RunningMoments() for ch in selected_channels}
+    segment_rows = _load_full_data_train_segments(waveform_dir, split)
+    for row in segment_rows:
+        rec = wfdb.rdrecord(str(row["segment_path"]))
+        signal_names = tuple(str(name) for name in rec.sig_name)
+        missing_in_segment = [ch for ch in selected_channels if ch not in signal_names]
+        if missing_in_segment:
+            raise ValueError(
+                f"Segment {row['segment_id']} missing channels {missing_in_segment}; "
+                f"available={signal_names}"
+            )
+        data = np.asarray(rec.p_signal, dtype=np.float64)
+        for ch in selected_channels:
+            moments[ch].update(data[:, signal_names.index(ch)])
+    return {
+        "method": "full_data_training_split_unique_segment_per_channel_zscore",
+        "waveform_dir": str(waveform_dir),
+        "splits_path": str(splits_path),
+        "split_used": split,
+        "channels": {ch: moments[ch].finalize() for ch in selected_channels},
+        "clipping": None,
+        "n_unique_segments": len(segment_rows),
+        "source": "anchors.csv segment_path rows filtered by split_label",
+    }
+
+
 def compute_training_channel_stats(
     waveform_dir: Path,
     splits_path: Path,
@@ -104,6 +191,16 @@ def compute_training_channel_stats(
 ) -> dict:
     waveform_dir = Path(waveform_dir)
     splits_path = Path(splits_path)
+    if _is_full_data_anchor_cache(waveform_dir):
+        if clip_lower_percentile is not None or clip_upper_percentile is not None:
+            raise ValueError("Percentile clipping is not implemented for full-data anchor caches.")
+        return _compute_full_data_segment_channel_stats(
+            waveform_dir=waveform_dir,
+            splits_path=splits_path,
+            channels=channels,
+            split=split,
+        )
+
     metadata = _load_waveform_metadata(waveform_dir)
     available_channels = tuple(metadata["channels"])
     if channels is None:

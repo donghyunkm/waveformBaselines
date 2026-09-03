@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from waveform_baselines.normalization import (
     compute_training_channel_stats,
@@ -25,6 +28,12 @@ def main():
         default=Path("outputs/splits/splits.json"),
     )
     parser.add_argument(
+        "--channels",
+        type=str,
+        default="",
+        help="Optional comma-separated channel list. Defaults to all channels in the waveform source.",
+    )
+    parser.add_argument(
         "--clip-lower-percentile",
         type=float,
         default=None,
@@ -44,10 +53,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    channels = tuple(ch.strip() for ch in args.channels.split(",") if ch.strip()) or None
 
     stats = compute_training_channel_stats(
         waveform_dir=args.waveform_dir,
         splits_path=args.splits_path,
+        channels=channels,
         clip_lower_percentile=args.clip_lower_percentile,
         clip_upper_percentile=args.clip_upper_percentile,
         clip_sample_size=args.clip_sample_size,

@@ -6,6 +6,7 @@ Compact summary of the fresh early-stopping-enabled vasopressor-free `patchtst_v
 
 - run tag: `vasopressor_free_v1_es`
 - model: `patchtst_v1`
+- waveform inputs: `3` channels, `ABP,II,PLETH`
 - task: single-target regression
 - cohort: vasopressor-free overlap cohort
 - split file: `outputs/splits/vasopressor_free_splits.json`
@@ -57,6 +58,7 @@ Compact summary of the fresh early-stopping-enabled vasopressor-free `patchtst_v
 ## Main Takeaways
 
 - The fresh `v1` rerun stayed numerically stable through training and evaluation; no regression task produced `NaN` predictions.
+- These `v1` regression runs used the repo's `3`-channel default model input (`ABP`, `II`, `PLETH`), not the full `4`-channel raw waveform set on disk (`II`, `ABP`, `PLETH`, `RESP`).
 - Core blood-pressure and plethysmography-derived targets remained the strongest signals on the vasopressor-free cohort.
 - Several interaction features and `PTT` remained weak or anti-predictive, so these are the clearest candidates for redesign or de-prioritization.
 - Early stopping reduced many runs well below the `50`-epoch cap while still yielding strong top-end performance.

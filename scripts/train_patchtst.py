@@ -19,9 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ except ImportError:
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from waveform_baselines.full_data_dataset import FullDataSegmentWaveformDataset
 from waveform_baselines.numpy_dataset import NumpyWaveformDataset
 from waveform_baselines.patient_sampler import PatientGroupedSampler
 from waveform_baselines.task_specs import DEFAULT_EVENT_TASK, DEFAULT_FEATURE_TASK
@@ -57,7 +59,8 @@ CORRELATION_FEATURE_NAMES = [
 
 ALL_FEATURE_NAMES = WAVEFORM_FEATURE_NAMES + CORRELATION_FEATURE_NAMES  # 26 total
 
-EVENT_NAMES = ["hypotension", "tachycardia"]
+EVENT_NAMES = list(DEFAULT_EVENT_TASK.event_names)
+SUPPORTED_EVENT_NAMES = EVENT_NAMES + [name for name in ("hypoxia",) if name not in EVENT_NAMES]
 
 FEATURE_HORIZONS = list(DEFAULT_FEATURE_TASK.horizons_min)   # minutes
 EVENT_HORIZONS = list(DEFAULT_EVENT_TASK.horizons_min)    # minutes
@@ -77,6 +80,23 @@ def feature_target_name(feature_name: str, horizon: int, horizon_mode: str) -> s
     if horizon_mode == "gap":
         suffix = f"{suffix}_gap"
     return f"{feature_name}_{suffix}"
+
+
+def parse_integral_ids(values, label: str) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{label} must be one-dimensional, got shape {arr.shape}")
+    numeric = arr.astype(np.float64)
+    if not np.isfinite(numeric).all():
+        raise ValueError(f"{label} contains non-finite IDs")
+    integral = numeric == np.floor(numeric)
+    if not integral.all():
+        examples = numeric[~integral][:10].tolist()
+        raise ValueError(f"{label} contains non-integral IDs, examples={examples}")
+    info = np.iinfo(np.int64)
+    if np.any(numeric < info.min) or np.any(numeric > info.max):
+        raise ValueError(f"{label} contains values outside int64 range")
+    return numeric.astype(np.int64)
 
 
 PHYSIOJEPA_FIDELITY_PRESET = {
@@ -176,11 +196,11 @@ def list_all_targets(feature_horizon_mode: str = "center"):
             print(f"  --task feature --feature-name {name} --horizon {h}{extra}")
     print()
     print(
-        f"=== Event Classification Targets ({len(EVENT_NAMES)} events × "
-        f"{len(EVENT_HORIZONS)} horizons = {len(EVENT_NAMES) * len(EVENT_HORIZONS)}) ==="
+        f"=== Event Classification Targets ({len(SUPPORTED_EVENT_NAMES)} events × "
+        f"{len(EVENT_HORIZONS)} horizons = {len(SUPPORTED_EVENT_NAMES) * len(EVENT_HORIZONS)}) ==="
     )
     for h in EVENT_HORIZONS:
-        for name in EVENT_NAMES:
+        for name in SUPPORTED_EVENT_NAMES:
             print(f"  --task event --event-name {name} --horizon {h}")
 
 
@@ -201,10 +221,12 @@ class TrainConfig:
     physiojepa_fidelity: bool = False
 
     # Data
+    dataset_format: str = "numpy_patient"
     channels: tuple[str, ...] = ("ABP", "II", "PLETH")
     n_channels: int = 3
     seq_len: int = 150_000  # 20 min at 125 Hz
     fs: int = 125
+    input_window_position: str = "center"
 
     # Architecture
     model_variant: str = "patchtst_v1"
@@ -241,6 +263,7 @@ class TrainConfig:
     # Infrastructure
     num_workers: int = 4
     normalize: bool = True
+    normalize_targets: bool = False
     seed: int = 42
     output_dir: str = ""  # auto-generated if empty
     log_interval: int = 100
@@ -275,6 +298,109 @@ class TrainConfig:
             )
         if self.seq_len <= 0 or self.seq_len % 2 != 0:
             raise ValueError(f"seq_len must be a positive even integer, got {self.seq_len}")
+        if self.input_window_position not in {"center", "input_end"}:
+            raise ValueError(
+                f"input_window_position must be 'center' or 'input_end', got {self.input_window_position!r}"
+            )
+        if self.input_window_position != "center" and self.dataset_format != "full_data_segments":
+            raise ValueError("input_window_position other than 'center' is only supported for full_data_segments")
+        if self.task != "feature" and self.normalize_targets:
+            raise ValueError("Target normalization is supported for regression feature tasks only.")
+
+
+@dataclass(frozen=True)
+class TargetNormalizationStats:
+    mean: float
+    std: float
+    source_split: str = "train"
+
+    def __post_init__(self):
+        if not np.isfinite(self.mean):
+            raise ValueError(f"Target normalization mean must be finite, got {self.mean}")
+        if not np.isfinite(self.std) or self.std <= 0:
+            raise ValueError(f"Target normalization std must be finite and > 0, got {self.std}")
+
+    def normalize_array(self, values: np.ndarray) -> np.ndarray:
+        return (values - self.mean) / self.std
+
+    def denormalize_array(self, values: np.ndarray) -> np.ndarray:
+        return values * self.std + self.mean
+
+    def normalize_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        return (values - self.mean) / self.std
+
+    def denormalize_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        return values * self.std + self.mean
+
+    def normalize_scalar(self, value: float) -> float:
+        return float((value - self.mean) / self.std)
+
+    def denormalize_scalar(self, value: float) -> float:
+        return float(value * self.std + self.mean)
+
+    def to_dict(self) -> dict[str, float | str]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "TargetNormalizationStats | None":
+        if not data:
+            return None
+        return cls(
+            mean=float(data["mean"]),
+            std=float(data["std"]),
+            source_split=str(data.get("source_split", "train")),
+        )
+
+
+def load_split_patient_ids(splits_path: Path, split: str) -> set[str]:
+    with open(splits_path) as handle:
+        splits = json.load(handle)
+    return {str(pid) for pid in splits[split]}
+
+
+def compute_train_target_normalization_stats(
+    target_values: np.ndarray,
+    target_mask: np.ndarray,
+    anchor_patient_ids: np.ndarray,
+    train_patient_ids: set[str],
+) -> TargetNormalizationStats:
+    train_mask = target_mask.astype(bool) & np.isfinite(target_values)
+    train_mask &= np.isin(anchor_patient_ids.astype(str), list(train_patient_ids))
+    train_values = target_values[train_mask].astype(np.float64)
+    if train_values.size == 0:
+        raise ValueError("No valid training targets available to compute normalization statistics.")
+    return TargetNormalizationStats(
+        mean=float(train_values.mean()),
+        std=float(train_values.std()),
+        source_split="train",
+    )
+
+
+def save_target_normalization_stats(output_dir: Path, stats: TargetNormalizationStats) -> Path:
+    path = output_dir / "target_normalization.json"
+    path.write_text(json.dumps(stats.to_dict(), indent=2))
+    return path
+
+
+def save_training_config(
+    output_dir: Path,
+    config: TrainConfig,
+    target_normalization: TargetNormalizationStats | None = None,
+) -> Path:
+    payload = {k: getattr(config, k) for k in config.__dataclass_fields__}
+    if target_normalization is not None:
+        payload["target_normalization"] = target_normalization.to_dict()
+    path = output_dir / "config.json"
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    return path
+
+
+def load_target_normalization_stats(path: Path) -> TargetNormalizationStats:
+    with open(path) as handle:
+        stats = TargetNormalizationStats.from_dict(json.load(handle))
+    if stats is None:
+        raise ValueError(f"Missing target normalization statistics in {path}")
+    return stats
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -990,7 +1116,12 @@ class TargetExtractor:
       - event_mask: (N, *)
     """
 
-    def __init__(self, config: TrainConfig, target_path: Path):
+    def __init__(
+        self,
+        config: TrainConfig,
+        target_path: Path,
+        target_normalization: TargetNormalizationStats | None = None,
+    ):
         bundle = np.load(target_path, allow_pickle=True)
         metadata = {}
         metadata_path = target_path.with_suffix(".json")
@@ -999,12 +1130,20 @@ class TargetExtractor:
                 metadata = json.load(handle)
         pids = bundle["anchor_patient_ids"].astype(str)
         times = bundle["anchor_times"].astype(np.float64)
+        anchor_ids = parse_integral_ids(bundle["anchor_ids"], "target bundle anchor_ids") if "anchor_ids" in bundle else None
+        segment_ids = bundle["segment_ids"].astype(str) if "segment_ids" in bundle else None
+        segment_names = bundle["segment_names"].astype(str) if "segment_names" in bundle else None
 
-        # Build lookup: (patient_id, anchor_time) -> row index
-        self.index = {
-            (str(pid), float(t)): idx
-            for idx, (pid, t) in enumerate(zip(pids, times))
-        }
+        # Legacy raw-waveform bundles are unique by (patient_id, anchor_time).
+        # Segment-aware full-data bundles can repeat those pairs, so they carry
+        # anchor_ids and are aligned by scripts/train_feature_models.py.
+        keys = [(str(pid), float(t)) for pid, t in zip(pids, times)]
+        if len(set(keys)) != len(keys) and anchor_ids is None and segment_ids is None and segment_names is None:
+            raise ValueError(f"Duplicate target anchor keys found in {target_path}")
+        self.index = {key: idx for idx, key in enumerate(keys)} if len(set(keys)) == len(keys) else {}
+        if anchor_ids is not None and len(set(anchor_ids.tolist())) != len(anchor_ids):
+            raise ValueError(f"Duplicate target anchor_ids found in {target_path}")
+        self.anchor_id_index = {int(anchor_id): idx for idx, anchor_id in enumerate(anchor_ids.tolist())} if anchor_ids is not None else None
 
         if config.task == "feature":
             all_targets = bundle["feature_targets"]  # (N, 78)
@@ -1028,6 +1167,11 @@ class TargetExtractor:
             target_names = metadata.get("event_target_names")
             col_idx = self._event_col_index(config.event_name, config.horizon, target_names)
 
+        self.anchor_patient_ids = pids
+        self.anchor_times = times
+        self.anchor_ids = anchor_ids
+        self.segment_ids = segment_ids
+        self.segment_names = segment_names
         self.targets = all_targets[:, col_idx]  # (N,)
         self.masks = all_masks[:, col_idx]  # (N,)
         # Data-loader-level safeguard: never treat non-finite targets as valid.
@@ -1037,6 +1181,7 @@ class TargetExtractor:
                   flush=True)
             self.masks = self.masks & np.isfinite(self.targets)
         self.task = config.task
+        self.target_normalization = target_normalization
 
     @staticmethod
     def _feature_col_index(
@@ -1058,13 +1203,45 @@ class TargetExtractor:
         target_names: list[str] | None = None,
     ) -> int:
         if target_names:
-            return target_names.index(f"{event_name}_within_{horizon}m")
+            candidates = (
+                f"{event_name}_within_{horizon}m",
+                f"{event_name}_onset_within_{horizon}m",
+            )
+            for candidate in candidates:
+                if candidate in target_names:
+                    return target_names.index(candidate)
+            available = ", ".join(str(name) for name in target_names[:10])
+            if len(target_names) > 10:
+                available += ", ..."
+            raise ValueError(
+                f"No event target column found for event={event_name!r}, horizon={horizon}m; "
+                f"tried {candidates}; available columns: {available}"
+            )
+        if event_name not in EVENT_NAMES:
+            raise ValueError(
+                f"Event {event_name!r} requires named target columns in the target bundle; "
+                "legacy unnamed event bundles only support "
+                f"{EVENT_NAMES}."
+            )
         horizon_idx = EVENT_HORIZONS.index(horizon)
         event_idx = EVENT_NAMES.index(event_name)
         return horizon_idx * len(EVENT_NAMES) + event_idx
 
+    def compute_training_target_normalization(self, splits_path: Path) -> TargetNormalizationStats:
+        if self.task != "feature":
+            raise ValueError("Target normalization is supported for regression feature tasks only.")
+        train_patient_ids = load_split_patient_ids(splits_path, "train")
+        return compute_train_target_normalization_stats(
+            target_values=self.targets,
+            target_mask=self.masks,
+            anchor_patient_ids=self.anchor_patient_ids,
+            train_patient_ids=train_patient_ids,
+        )
+
     def get(self, patient_id: str, anchor_time: float):
         """Returns (target_value, is_valid) for a single window."""
+        if not self.index:
+            return 0.0, False
         row_idx = self.index.get((patient_id, anchor_time))
         if row_idx is None:
             return 0.0, False
@@ -1072,6 +1249,23 @@ class TargetExtractor:
         is_valid = bool(self.masks[row_idx]) and np.isfinite(target)
         if not is_valid:
             return 0.0, False
+        if self.target_normalization is not None:
+            target = self.target_normalization.normalize_scalar(target)
+        return target, True
+
+    def get_by_anchor_id(self, anchor_id: int):
+        """Returns (target_value, is_valid) for a single anchor_id."""
+        if self.anchor_id_index is None:
+            return 0.0, False
+        row_idx = self.anchor_id_index.get(int(anchor_id))
+        if row_idx is None:
+            return 0.0, False
+        target = float(self.targets[row_idx])
+        is_valid = bool(self.masks[row_idx]) and np.isfinite(target)
+        if not is_valid:
+            return 0.0, False
+        if self.target_normalization is not None:
+            target = self.target_normalization.normalize_scalar(target)
         return target, True
 
 
@@ -1097,28 +1291,26 @@ class SingleTargetDataset(torch.utils.data.Dataset):
             self._patient_ids_filtered: list[str] = []
             self._patient_boundaries_filtered: list[tuple[int, int]] = []
 
-            orig_pids = numpy_ds.patient_ids
             orig_bounds = numpy_ds.patient_boundaries
+            patient_ids_with_valid_targets: set[str] = set()
 
-            for p_idx, pid in enumerate(orig_pids):
-                start, end = orig_bounds[p_idx]
+            for start, end in orig_bounds:
                 patient_valid_start = len(self._valid_indices)
 
                 for orig_idx in range(start, end):
                     # Look up mask without loading waveform
-                    window_pid, anchor_center = numpy_ds._windows[orig_idx]
-                    seg_start = numpy_ds._patient_seg_start[window_pid]
-                    anchor_time = seg_start + anchor_center / float(numpy_ds.fs)
-                    _, is_valid = target_extractor.get(window_pid, anchor_time)
+                    identity = dataset_target_identity(numpy_ds, orig_idx)
+                    _, is_valid = target_value_for_identity(target_extractor, identity)
                     if is_valid:
                         self._valid_indices.append(orig_idx)
+                        patient_ids_with_valid_targets.add(str(identity["patient_id"]))
 
                 patient_valid_end = len(self._valid_indices)
                 if patient_valid_end > patient_valid_start:
-                    self._patient_ids_filtered.append(pid)
                     self._patient_boundaries_filtered.append(
                         (patient_valid_start, patient_valid_end)
                     )
+            self._patient_ids_filtered = sorted(patient_ids_with_valid_targets)
 
             n_orig = len(numpy_ds)
             n_valid = len(self._valid_indices)
@@ -1153,12 +1345,15 @@ class SingleTargetDataset(torch.utils.data.Dataset):
         sample = self.numpy_ds[orig_index]
         out = {
             "waveform": sample["waveform"],
+            "patient_id": sample.get("patient_id", ""),
+            "anchor_time": sample.get("anchor_time", np.nan),
+            "anchor_id": sample.get("anchor_id", -1),
+            "segment_id": sample.get("segment_id", ""),
+            "segment_name": sample.get("segment_name", ""),
         }
 
         if self.target_extractor is not None:
-            target, mask = self.target_extractor.get(
-                sample["patient_id"], sample["anchor_time"]
-            )
+            target, mask = target_value_for_identity(self.target_extractor, sample)
             out["target"] = target
             out["mask"] = mask
         else:
@@ -1167,6 +1362,42 @@ class SingleTargetDataset(torch.utils.data.Dataset):
             out["mask"] = True
 
         return out
+
+
+def dataset_target_identity(numpy_ds, orig_idx: int) -> dict[str, object]:
+    if hasattr(numpy_ds, "target_identity"):
+        return numpy_ds.target_identity(orig_idx)
+    window_pid, anchor_center = numpy_ds._windows[orig_idx]
+    seg_start = numpy_ds._patient_seg_start[window_pid]
+    anchor_time = seg_start + anchor_center / float(numpy_ds.fs)
+    return {"patient_id": window_pid, "anchor_time": anchor_time}
+
+
+def target_value_for_identity(target_extractor: TargetExtractor, identity: dict[str, object]):
+    anchor_id = identity.get("anchor_id")
+    if anchor_id is not None and int(anchor_id) >= 0 and target_extractor.anchor_id_index is not None:
+        return target_extractor.get_by_anchor_id(int(anchor_id))
+    return target_extractor.get(str(identity["patient_id"]), float(identity["anchor_time"]))
+
+
+def build_waveform_dataset(config: TrainConfig, split: str):
+    dataset_cls = {
+        "numpy_patient": NumpyWaveformDataset,
+        "full_data_segments": FullDataSegmentWaveformDataset,
+    }.get(config.dataset_format)
+    if dataset_cls is None:
+        raise ValueError(f"Unknown dataset_format={config.dataset_format!r}")
+    kwargs = {
+        "split": split,
+        "waveform_dir": Path(config.waveform_dir),
+        "splits_path": Path(config.splits_path),
+        "normalize": config.normalize,
+        "channels": config.channels,
+        "seq_len": config.seq_len,
+    }
+    if config.dataset_format == "full_data_segments":
+        kwargs["input_window_position"] = config.input_window_position
+    return dataset_cls(**kwargs)
 
 
 # ── Collate ───────────────────────────────────────────────────────────────────
@@ -1188,7 +1419,16 @@ def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor]:
     if not finite_waveforms.all():
         masks = masks & finite_waveforms
 
-    return {"waveform": waveforms, "target": targets, "mask": masks}
+    return {
+        "waveform": waveforms,
+        "target": targets,
+        "mask": masks,
+        "patient_id": [str(s.get("patient_id", "")) for s in batch],
+        "anchor_time": torch.tensor([float(s.get("anchor_time", float("nan"))) for s in batch], dtype=torch.float64),
+        "anchor_id": torch.tensor([int(s.get("anchor_id", -1)) for s in batch], dtype=torch.int64),
+        "segment_id": [str(s.get("segment_id", "")) for s in batch],
+        "segment_name": [str(s.get("segment_name", "")) for s in batch],
+    }
 
 
 # ── Training utilities ────────────────────────────────────────────────────────
@@ -1241,40 +1481,52 @@ def train(config: TrainConfig):
     print(flush=True)
 
     # Save config
-    (output_dir / "config.json").write_text(json.dumps(
-        {k: getattr(config, k) for k in config.__dataclass_fields__},
-        indent=2, default=str
-    ))
+    save_training_config(output_dir, config)
 
     # Target extractor
     target_extractor = None
+    target_normalization = None
     if config.target_path:
         target_extractor = TargetExtractor(config, Path(config.target_path))
         print(f"Loaded targets from {config.target_path}", flush=True)
+        if config.normalize_targets:
+            target_normalization = target_extractor.compute_training_target_normalization(
+                Path(config.splits_path)
+            )
+            save_target_normalization_stats(output_dir, target_normalization)
+            save_training_config(output_dir, config, target_normalization=target_normalization)
+            print(
+                "Computed train-only target normalization: "
+                f"mean={target_normalization.mean:.6f}, std={target_normalization.std:.6f}",
+                flush=True,
+            )
+            target_extractor = TargetExtractor(
+                config,
+                Path(config.target_path),
+                target_normalization=target_normalization,
+            )
 
     # Datasets — using pre-extracted numpy files
     print("Loading datasets...", flush=True)
-    train_numpy_ds = NumpyWaveformDataset(
-        split="train",
-        waveform_dir=Path(config.waveform_dir),
-        splits_path=Path(config.splits_path),
-        normalize=config.normalize,
-        channels=config.channels,
-        seq_len=config.seq_len,
-    )
-    val_numpy_ds = NumpyWaveformDataset(
-        split="val",
-        waveform_dir=Path(config.waveform_dir),
-        splits_path=Path(config.splits_path),
-        normalize=config.normalize,
-        channels=config.channels,
-        seq_len=config.seq_len,
-    )
+    train_numpy_ds = build_waveform_dataset(config, split="train")
+    val_numpy_ds = build_waveform_dataset(config, split="val")
 
     train_ds = SingleTargetDataset(train_numpy_ds, target_extractor)
     val_ds = SingleTargetDataset(val_numpy_ds, target_extractor)
     print(f"  Train: {len(train_ds):,} windows ({len(train_ds.patient_ids)} patients)", flush=True)
     print(f"  Val:   {len(val_ds):,} windows ({len(val_ds.patient_ids)} patients)", flush=True)
+    if target_normalization is not None:
+        train_patient_ids = load_split_patient_ids(Path(config.splits_path), "train")
+        train_mask = target_extractor.masks.astype(bool) & np.isfinite(target_extractor.targets)
+        train_mask &= np.isin(target_extractor.anchor_patient_ids.astype(str), list(train_patient_ids))
+        train_targets = target_normalization.normalize_array(
+            target_extractor.targets[train_mask].astype(np.float64)
+        )
+        print(
+            "  Normalized train targets: "
+            f"mean={train_targets.mean():.6f}, std={train_targets.std():.6f}",
+            flush=True,
+        )
 
     # Patient-grouped batch sampler for training
     train_sampler = PatientGroupedSampler(
@@ -1300,24 +1552,25 @@ def train(config: TrainConfig):
     # - pin_memory: faster CPU->GPU transfer
     # - prefetch_factor: keep more batches ready
     # - persistent_workers: avoid worker respawn overhead
-    train_loader = DataLoader(
-        train_ds,
-        batch_sampler=train_sampler,
-        num_workers=config.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=True,
-        prefetch_factor=4,
-        persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_sampler=val_sampler,
-        num_workers=config.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=True,
-        prefetch_factor=4,
-        persistent_workers=True,
-    )
+    train_loader_kwargs = {
+        "batch_sampler": train_sampler,
+        "num_workers": config.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": True,
+        "persistent_workers": config.num_workers > 0,
+    }
+    val_loader_kwargs = {
+        "batch_sampler": val_sampler,
+        "num_workers": config.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": True,
+        "persistent_workers": config.num_workers > 0,
+    }
+    if config.num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = 4
+        val_loader_kwargs["prefetch_factor"] = 4
+    train_loader = DataLoader(train_ds, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, **val_loader_kwargs)
 
     # Model
     model = PatchTST(config).to(device)
@@ -1326,13 +1579,20 @@ def train(config: TrainConfig):
     if config.model_variant == "patchtst_v1_5":
         log_v15_architecture(config, model.n_patches)
 
-    compile_supported = hasattr(torch, "compile") and config.model_variant == "patchtst_v1"
+    disable_compile = os.environ.get("PATCHTST_DISABLE_COMPILE", "0") == "1"
+    compile_supported = (
+        hasattr(torch, "compile")
+        and config.model_variant == "patchtst_v1"
+        and not disable_compile
+    )
     if compile_supported:
         try:
             model = torch.compile(model)
             print("  torch.compile enabled", flush=True)
         except Exception as e:
             print(f"  torch.compile failed ({e}), using eager mode", flush=True)
+    elif disable_compile and config.model_variant == "patchtst_v1":
+        print("  torch.compile disabled by PATCHTST_DISABLE_COMPILE=1", flush=True)
     elif config.model_variant in {"patchtst_v1_5", "patchtst_v2"}:
         print(f"  torch.compile disabled for {config.model_variant}", flush=True)
 
@@ -1507,6 +1767,7 @@ def train(config: TrainConfig):
                 "epochs_without_improvement": epochs_without_improvement,
                 "config": {k: getattr(config, k) for k in config.__dataclass_fields__},
                 "target_key": config.target_key,
+                "target_normalization": target_normalization.to_dict() if target_normalization is not None else None,
             }, output_dir / "best_model.pt")
             print(f"  -> Best (val_loss={val_loss:.6f})", flush=True)
         else:
@@ -1522,6 +1783,7 @@ def train(config: TrainConfig):
             "epochs_without_improvement": epochs_without_improvement,
             "config": {k: getattr(config, k) for k in config.__dataclass_fields__},
             "target_key": config.target_key,
+            "target_normalization": target_normalization.to_dict() if target_normalization is not None else None,
         }, output_dir / "latest_model.pt")
 
         if (
@@ -1555,7 +1817,7 @@ def main():
     parser.add_argument("--feature-name", type=str, default="MAP",
                         help=f"One of: {ALL_FEATURE_NAMES}")
     parser.add_argument("--event-name", type=str, default="hypotension",
-                        choices=EVENT_NAMES)
+                        choices=SUPPORTED_EVENT_NAMES)
     parser.add_argument("--horizon", type=int, default=0,
                         help="Prediction horizon in minutes")
     parser.add_argument("--feature-horizon-mode", type=str, default="center",
@@ -1568,7 +1830,16 @@ def main():
                         help="Apply the PhysioJEPA-fidelity patchtst_v1_5 architecture preset.")
     parser.add_argument("--channels", type=str, default="ABP,II,PLETH",
                         help="Comma-separated waveform channel order to load")
+    parser.add_argument("--dataset-format", type=str, default="numpy_patient",
+                        choices=["numpy_patient", "full_data_segments"])
     parser.add_argument("--seq-len", type=int, default=150_000)
+    parser.add_argument(
+        "--input-window-position",
+        type=str,
+        default="center",
+        choices=["center", "input_end"],
+        help="For full_data_segments, choose the centered window or the trailing window ending at the original 20-minute input boundary.",
+    )
     parser.add_argument("--n-channels", type=int, default=3)
     parser.add_argument("--patch-len", type=int, default=250)
     parser.add_argument("--stride", type=int, default=250)
@@ -1611,6 +1882,9 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--normalize", action="store_true", default=True)
     parser.add_argument("--no-normalize", action="store_false", dest="normalize")
+    parser.add_argument("--normalize-targets", action="store_true", default=False,
+                        help="Z-score regression targets using train-split statistics only.")
+    parser.add_argument("--no-normalize-targets", action="store_false", dest="normalize_targets")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--target-path", type=str, default="")
@@ -1655,10 +1929,12 @@ def main():
         feature_horizon_mode=args.feature_horizon_mode,
         run_tag=args.run_tag,
         physiojepa_fidelity=args.physiojepa_fidelity,
+        dataset_format=args.dataset_format,
         channels=channels,
         model_variant=args.model_variant,
         n_channels=args.n_channels,
         seq_len=args.seq_len,
+        input_window_position=args.input_window_position,
         patch_len=args.patch_len,
         stride=args.stride,
         d_model=args.d_model,
@@ -1688,6 +1964,7 @@ def main():
         early_stopping_min_delta=args.early_stopping_min_delta,
         num_workers=args.num_workers,
         normalize=args.normalize,
+        normalize_targets=args.normalize_targets,
         seed=args.seed,
         output_dir=args.output_dir,
         target_path=args.target_path,

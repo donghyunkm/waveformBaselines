@@ -6,7 +6,7 @@ These are historical results only. The standard `all_targets.npz` bundle used
 by this evaluation contains center-mode `t+0` regression targets that overlap
 the 20-minute input, so these regression results must not be used as
 leakage-free results. Current leakage-safe regression results are documented
-in `docs/regression_results_v1_vaso_free_sorted.md` and use gap mode.
+in `docs/v1_vasopressor_free/regression_results_v1_vaso_free_sorted.md` and use gap mode.
 
 ## Setup
 
@@ -55,3 +55,4 @@ in `docs/regression_results_v1_vaso_free_sorted.md` and use gap mode.
 - Regression baseline was the train-mean predictor.
 - Classification baseline was random ranking.
 - Evaluation later gained bootstrap CIs for event metrics, but this `pre-v1` result set predates the current rerun batches.
+- On 2026-08-27, `scripts/eval_patchtst.py` was hardened so evaluation now reconstructs dataset paths, splits, target bundle, task selection, and model architecture from each checkpoint's saved training config by default, and checkpoint loading now strips only `_orig_mod.` before requiring `strict=True`. This prevents mixed `--all` batches from accidentally reusing the current CLI/default `waveform_dir`, `splits_path`, `target_path`, or model variant across unrelated experiments.

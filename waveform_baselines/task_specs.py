@@ -74,9 +74,11 @@ class EventTaskSpec:
     target_generation_mode: str = "anchor_horizon"
     hypotension_threshold: float = 65.0
     tachycardia_threshold: float = 110.0
+    hypoxia_threshold: float = 90.0
     sustain_minutes: int = 5
     hypotension_channel: int = 0
     tachycardia_channel: int = 4
+    hypoxia_channel: int = 2
     event_names: tuple[str, ...] = ("hypotension", "tachycardia")
 
     @property

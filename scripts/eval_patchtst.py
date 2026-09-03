@@ -24,7 +24,6 @@ import json
 import sys
 import time
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +32,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from waveform_baselines.numpy_dataset import NumpyWaveformDataset
 from waveform_baselines.patient_sampler import PatientGroupedSampler
 
 # Import shared definitions from train script
@@ -43,10 +41,15 @@ from train_patchtst import (
     EVENT_NAMES,
     FEATURE_HORIZONS,
     PatchTST,
+    TargetNormalizationStats,
+    load_target_normalization_stats,
     parse_channel_list,
     SingleTargetDataset,
+    SUPPORTED_EVENT_NAMES,
     TargetExtractor,
     TrainConfig,
+    _cli_flag_set,
+    build_waveform_dataset,
     collate_fn,
 )
 
@@ -113,16 +116,192 @@ class LegacyPatchTSTV1(nn.Module):
 
 def build_model_for_checkpoint(config: TrainConfig, state_dict: dict[str, torch.Tensor]) -> nn.Module:
     """Instantiate the model variant that matches the saved checkpoint layout."""
-    if (
-        "patch_embed.channel_embed.weight" in state_dict
-        and "encoder_norm.weight" not in state_dict
-        and "norm.weight" in state_dict
-    ):
+    inferred_variant = infer_checkpoint_model_variant(state_dict)
+    if inferred_variant == "legacy_patchtst_v1":
+        if config.model_variant != "patchtst_v1":
+            raise ValueError(
+                f"Checkpoint layout is legacy patchtst_v1, but evaluation config requested "
+                f"{config.model_variant}."
+            )
         return LegacyPatchTSTV1(config)
+    if inferred_variant != config.model_variant:
+        raise ValueError(
+            f"Checkpoint layout indicates model_variant={inferred_variant}, but evaluation config "
+            f"requested {config.model_variant}."
+        )
     return PatchTST(config)
 
 
-def find_all_completed_models(base_dir: Path) -> list[dict]:
+def infer_checkpoint_model_variant(state_dict: dict[str, torch.Tensor]) -> str:
+    keys = set(state_dict)
+    if any(key.startswith("v15_") for key in keys):
+        return "patchtst_v1_5"
+    if (
+        "patch_embed.channel_embed.weight" in keys
+        and "encoder_norm.weight" not in keys
+        and "norm.weight" in keys
+    ):
+        return "legacy_patchtst_v1"
+    if (
+        "channel_embed.weight" in keys
+        or any(key.startswith("fusion_layers.") for key in keys)
+        or any(key.startswith("final_norm.") for key in keys)
+    ):
+        return "patchtst_v2"
+    return "patchtst_v1"
+
+
+def strip_compile_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Remove torch.compile's _orig_mod. prefix and reject ambiguous collisions."""
+    if not any(key.startswith("_orig_mod.") for key in state_dict):
+        return state_dict
+
+    cleaned: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key.replace("_orig_mod.", "", 1) if key.startswith("_orig_mod.") else key
+        if new_key in cleaned:
+            raise ValueError(f"State dict key collision after stripping _orig_mod.: {new_key}")
+        cleaned[new_key] = value
+    return cleaned
+
+
+EVAL_OVERRIDE_FIELDS = {
+    "--task": "task",
+    "--feature-name": "feature_name",
+    "--event-name": "event_name",
+    "--horizon": "horizon",
+    "--feature-horizon-mode": "feature_horizon_mode",
+    "--seq-len": "seq_len",
+    "--input-window-position": "input_window_position",
+    "--model-variant": "model_variant",
+    "--dataset-format": "dataset_format",
+    "--waveform-dir": "waveform_dir",
+    "--splits-path": "splits_path",
+    "--target-path": "target_path",
+    "--run-tag": "run_tag",
+}
+
+COMMON_EVAL_REQUIRED_FIELDS = {
+    "task",
+    "horizon",
+    "channels",
+    "n_channels",
+    "seq_len",
+    "model_variant",
+    "patch_len",
+    "stride",
+    "d_model",
+    "n_heads",
+    "n_layers",
+    "d_ff",
+    "dropout",
+    "normalize",
+    "seed",
+    "waveform_dir",
+    "splits_path",
+    "target_path",
+}
+
+VARIANT_REQUIRED_FIELDS = {
+    "patchtst_v1": set(),
+    "patchtst_v1_5": {
+        "attn_dropout",
+        "qkv_bias",
+        "pool_depth",
+        "pool_mlp_ratio",
+        "pool_num_queries",
+        "pool_complete_block",
+        "pool_affine",
+    },
+    "patchtst_v2": {
+        "cross_channel_layers",
+        "cross_channel_heads",
+        "cross_channel_window",
+        "pooling_type",
+    },
+}
+
+
+def extract_explicit_eval_overrides(args: argparse.Namespace, explicit_flags: set[str]) -> dict:
+    overrides = {
+        field_name: getattr(args, field_name)
+        for flag_name, field_name in EVAL_OVERRIDE_FIELDS.items()
+        if flag_name in explicit_flags
+    }
+    if "--channels" in explicit_flags:
+        channels = parse_channel_list(args.channels)
+        overrides["channels"] = channels
+        if "--n-channels" in explicit_flags:
+            overrides["n_channels"] = args.n_channels
+        else:
+            overrides["n_channels"] = len(channels)
+    elif "--n-channels" in explicit_flags:
+        overrides["n_channels"] = args.n_channels
+    return overrides
+
+
+def required_eval_fields(config_values: dict) -> set[str]:
+    required = set(COMMON_EVAL_REQUIRED_FIELDS)
+    task = config_values.get("task")
+    if task == "feature":
+        required.add("feature_name")
+        required.add("feature_horizon_mode")
+    elif task == "event":
+        required.add("event_name")
+    variant = config_values.get("model_variant")
+    required.update(VARIANT_REQUIRED_FIELDS.get(variant, set()))
+    return required
+
+
+def validate_eval_config_values(config_values: dict) -> None:
+    missing = [
+        field_name
+        for field_name in sorted(required_eval_fields(config_values))
+        if field_name not in config_values or config_values[field_name] in (None, "")
+    ]
+    if missing:
+        raise ValueError(
+            "Saved training configuration is missing required evaluation fields: "
+            + ", ".join(missing)
+        )
+
+
+def train_config_from_saved_and_overrides(saved_config: dict | None, overrides: dict) -> TrainConfig:
+    config_values: dict = {}
+    if saved_config:
+        config_values.update({
+            field_name: saved_config[field_name]
+            for field_name in TrainConfig.__dataclass_fields__
+            if field_name in saved_config
+        })
+    config_values.update(overrides)
+    validate_eval_config_values(config_values)
+    return TrainConfig(
+        **{
+            field_name: config_values[field_name]
+            for field_name in TrainConfig.__dataclass_fields__
+            if field_name in config_values
+        }
+    )
+
+
+def load_saved_training_config(checkpoint_path: Path) -> dict:
+    config_path = checkpoint_path.parent / "config.json"
+    if config_path.exists():
+        with open(config_path) as handle:
+            return json.load(handle)
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    saved_config = ckpt.get("config")
+    if isinstance(saved_config, dict):
+        return saved_config
+    raise FileNotFoundError(
+        f"No saved training config found for checkpoint {checkpoint_path}. "
+        "Expected either config.json next to the checkpoint or a checkpoint['config'] entry."
+    )
+
+
+def find_all_completed_models(base_dir: Path, skip_existing: bool = False) -> list[dict]:
     """Find all output directories that have a best_model.pt checkpoint."""
     models = []
     if not base_dir.exists():
@@ -130,6 +309,9 @@ def find_all_completed_models(base_dir: Path) -> list[dict]:
     for task_dir in sorted(path.parent for path in base_dir.rglob("best_model.pt")):
         ckpt = task_dir / "best_model.pt"
         config_file = task_dir / "config.json"
+        if skip_existing and (task_dir / "test_metrics.json").exists() and (task_dir / "test_predictions.npz").exists():
+            print(f"Skipping existing evaluation: {task_dir}", flush=True)
+            continue
         if ckpt.exists() and config_file.exists():
             with open(config_file) as f:
                 config = json.load(f)
@@ -250,6 +432,24 @@ def bootstrap_metric_interval(
     return ci
 
 
+def resolve_target_normalization(
+    config: TrainConfig,
+    checkpoint_path: Path,
+    checkpoint: dict,
+) -> TargetNormalizationStats | None:
+    if not config.normalize_targets:
+        return None
+    sidecar_path = checkpoint_path.parent / "target_normalization.json"
+    if sidecar_path.exists():
+        return load_target_normalization_stats(sidecar_path)
+    stats = TargetNormalizationStats.from_dict(checkpoint.get("target_normalization"))
+    if stats is None:
+        raise FileNotFoundError(
+            f"Target normalization is enabled for {checkpoint_path}, but no saved target stats were found."
+        )
+    return stats
+
+
 def evaluate_single(
     config: TrainConfig,
     checkpoint_path: Path,
@@ -273,31 +473,29 @@ def evaluate_single(
 
     # Load model
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt["model_state_dict"]
+    state_dict = strip_compile_prefix(ckpt["model_state_dict"])
     model = build_model_for_checkpoint(config, state_dict).to(device)
-
-    # Handle state dict (may have _orig_mod prefix from torch.compile)
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError:
-        cleaned = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(cleaned, strict=False)
+    model.load_state_dict(state_dict, strict=True)
 
     best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("nan")))
     train_epochs = ckpt.get("epoch", "?")
+    target_normalization = resolve_target_normalization(config, checkpoint_path, ckpt)
     print(f"  Loaded checkpoint: epoch={train_epochs}, best_val_loss={best_val_loss:.6f}", flush=True)
+    if target_normalization is not None:
+        print(
+            "  Loaded target normalization: "
+            f"mean={target_normalization.mean:.6f}, std={target_normalization.std:.6f}",
+            flush=True,
+        )
 
     # Load test dataset
-    target_extractor = TargetExtractor(config, Path(config.target_path))
-
-    test_numpy_ds = NumpyWaveformDataset(
-        split="test",
-        waveform_dir=Path(config.waveform_dir),
-        splits_path=Path(config.splits_path),
-        normalize=config.normalize,
-        channels=config.channels,
-        seq_len=config.seq_len,
+    target_extractor = TargetExtractor(
+        config,
+        Path(config.target_path),
+        target_normalization=target_normalization,
     )
+
+    test_numpy_ds = build_waveform_dataset(config, split="test")
     test_ds = SingleTargetDataset(test_numpy_ds, target_extractor)
     print(f"  Test set: {len(test_ds):,} windows ({len(test_ds.patient_ids)} patients)", flush=True)
 
@@ -325,6 +523,11 @@ def evaluate_single(
     all_preds = []
     all_targets = []
     all_masks = []
+    all_patient_ids = []
+    all_anchor_times = []
+    all_anchor_ids = []
+    all_segment_ids = []
+    all_segment_names = []
 
     t0 = time.time()
     with torch.no_grad():
@@ -339,17 +542,32 @@ def evaluate_single(
             all_preds.append(pred.squeeze(-1).float().cpu().numpy())
             all_targets.append(target.numpy())
             all_masks.append(mask.numpy())
+            all_patient_ids.extend(batch["patient_id"])
+            all_anchor_times.append(batch["anchor_time"].numpy())
+            all_anchor_ids.append(batch["anchor_id"].numpy())
+            all_segment_ids.extend(batch["segment_id"])
+            all_segment_names.extend(batch["segment_name"])
 
     elapsed = time.time() - t0
     preds = np.concatenate(all_preds).astype(np.float64)
     targets = np.concatenate(all_targets).astype(np.float64)
     masks = np.concatenate(all_masks)
+    patient_ids = np.asarray(all_patient_ids).astype(str)
+    anchor_times = np.concatenate(all_anchor_times).astype(np.float64)
+    anchor_ids = np.concatenate(all_anchor_ids).astype(np.int64)
+    segment_ids = np.asarray(all_segment_ids).astype(str)
+    segment_names = np.asarray(all_segment_names).astype(str)
+    preds_original = preds
+    targets_original = targets
+    if target_normalization is not None:
+        preds_original = target_normalization.denormalize_array(preds)
+        targets_original = target_normalization.denormalize_array(targets)
 
     print(f"  Inference: {len(preds):,} samples in {elapsed:.1f}s "
           f"({len(preds)/elapsed:.0f} samples/s)", flush=True)
 
     # Compute metrics on valid samples (mask=True AND finite predictions)
-    valid = masks.astype(bool) & np.isfinite(preds) & np.isfinite(targets)
+    valid = masks.astype(bool) & np.isfinite(preds_original) & np.isfinite(targets_original)
     n_valid = valid.sum()
     n_nan_preds = int(np.isnan(preds).sum())
     metrics = {"n_total": len(preds), "n_valid": int(n_valid), "n_nan_preds": n_nan_preds}
@@ -358,8 +576,8 @@ def evaluate_single(
         print(f"  Note: {n_nan_preds} NaN predictions filtered out", flush=True)
 
     if n_valid > 0:
-        p_valid = preds[valid]
-        t_valid = targets[valid]
+        p_valid = preds_original[valid]
+        t_valid = targets_original[valid]
 
         if config.task == "feature":
             # Regression metrics
@@ -437,9 +655,24 @@ def evaluate_single(
     pred_path = output_dir / "test_predictions.npz"
     np.savez(
         pred_path,
-        predictions=preds,
-        targets=targets,
+        predictions=preds_original,
+        targets=targets_original,
+        predictions_normalized=preds,
+        targets_normalized=targets,
         masks=masks,
+        sample_ids=np.asarray([
+            f"anchor_id:{int(anchor_id)}" if int(anchor_id) >= 0 else f"{pid}|{float(anchor_time):.6f}"
+            for pid, anchor_time, anchor_id in zip(patient_ids.tolist(), anchor_times.tolist(), anchor_ids.tolist())
+        ]).astype(str),
+        patient_time_sample_ids=np.asarray([
+            f"{pid}|{float(anchor_time):.6f}"
+            for pid, anchor_time in zip(patient_ids.tolist(), anchor_times.tolist())
+        ]).astype(str),
+        patient_ids=patient_ids,
+        anchor_times=anchor_times,
+        anchor_ids=anchor_ids,
+        segment_ids=segment_ids,
+        segment_names=segment_names,
         task=config.task,
         target_key=config.target_key,
         best_val_loss=best_val_loss,
@@ -452,6 +685,8 @@ def evaluate_single(
     metrics_path = output_dir / "test_metrics.json"
     metrics["target_key"] = config.target_key
     metrics["task"] = config.task
+    if target_normalization is not None:
+        metrics["target_normalization"] = target_normalization.to_dict()
     metrics["best_val_loss"] = float(best_val_loss)
     metrics["train_epochs"] = int(train_epochs) if isinstance(train_epochs, (int, float)) else train_epochs
     with open(metrics_path, "w") as f:
@@ -465,14 +700,25 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate PatchTST on test set")
     parser.add_argument("--all", action="store_true",
                         help="Evaluate all completed models in outputs/patchtst/")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="When using --all, skip checkpoints that already have test metrics and predictions")
     parser.add_argument("--task", type=str, default="feature", choices=["feature", "event"])
     parser.add_argument("--feature-name", type=str, default="MAP")
-    parser.add_argument("--event-name", type=str, default="hypotension", choices=EVENT_NAMES)
+    parser.add_argument("--event-name", type=str, default="hypotension", choices=SUPPORTED_EVENT_NAMES)
     parser.add_argument("--horizon", type=int, default=0)
     parser.add_argument("--feature-horizon-mode", type=str, default="center", choices=["center", "gap"])
     parser.add_argument("--channels", type=str, default="ABP,II,PLETH",
                         help="Comma-separated waveform channel order to load")
+    parser.add_argument("--dataset-format", type=str, default="numpy_patient",
+                        choices=["numpy_patient", "full_data_segments"])
     parser.add_argument("--seq-len", type=int, default=150_000)
+    parser.add_argument(
+        "--input-window-position",
+        type=str,
+        default="center",
+        choices=["center", "input_end"],
+        help="For full_data_segments, choose the centered window or the trailing window ending at the original 20-minute input boundary.",
+    )
     parser.add_argument("--n-channels", type=int, default=3)
     parser.add_argument("--model-variant", type=str, default="patchtst_v1",
                         choices=["patchtst_v1", "patchtst_v1_5", "patchtst_v2"])
@@ -494,11 +740,8 @@ def main():
     parser.add_argument("--ci-level", type=float, default=0.95,
                         help="Confidence level for event-task bootstrap intervals")
     args = parser.parse_args()
-    channels = parse_channel_list(args.channels)
-    if len(channels) != args.n_channels:
-        parser.error(
-            f"--n-channels={args.n_channels} does not match parsed channel list {channels}"
-        )
+    explicit_flags = _cli_flag_set()
+    explicit_overrides = extract_explicit_eval_overrides(args, explicit_flags)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
@@ -507,7 +750,7 @@ def main():
 
     if args.all:
         # Evaluate all completed models
-        models = find_all_completed_models(base_dir)
+        models = find_all_completed_models(base_dir, skip_existing=args.skip_existing)
         if not models:
             print("No completed models found in", base_dir)
             sys.exit(1)
@@ -516,35 +759,7 @@ def main():
         all_metrics = []
 
         for info in models:
-            cfg = info["config"]
-            config = TrainConfig(
-                task=cfg["task"],
-                feature_name=cfg.get("feature_name", "MAP"),
-                event_name=cfg.get("event_name", "hypotension"),
-                horizon=cfg.get("horizon", 0),
-                feature_horizon_mode=cfg.get("feature_horizon_mode", "center"),
-                run_tag=cfg.get("run_tag", ""),
-                channels=tuple(cfg.get("channels", ["ABP", "II", "PLETH"])),
-                model_variant=cfg.get("model_variant", "patchtst_v1"),
-                n_channels=cfg.get("n_channels", 3),
-                seq_len=cfg.get("seq_len", 150_000),
-                d_model=cfg.get("d_model", 128),
-                n_heads=cfg.get("n_heads", 8),
-                n_layers=cfg.get("n_layers", 4),
-                d_ff=cfg.get("d_ff", 256),
-                dropout=cfg.get("dropout", 0.1),
-                patch_len=cfg.get("patch_len", 250),
-                stride=cfg.get("stride", 250),
-                cross_channel_layers=cfg.get("cross_channel_layers", 1),
-                cross_channel_heads=cfg.get("cross_channel_heads", 4),
-                cross_channel_window=cfg.get("cross_channel_window", 1),
-                pooling_type=cfg.get("pooling_type", "mean"),
-                normalize=cfg.get("normalize", True),
-                seed=cfg.get("seed", 42),
-                waveform_dir=args.waveform_dir,
-                splits_path=args.splits_path,
-                target_path=args.target_path,
-            )
+            config = train_config_from_saved_and_overrides(info["config"], explicit_overrides)
             metrics = evaluate_single(
                 config=config,
                 checkpoint_path=info["checkpoint"],
@@ -599,23 +814,26 @@ def main():
 
     else:
         # Evaluate single model
-        config = TrainConfig(
+        cli_channels = parse_channel_list(args.channels)
+        cli_config = TrainConfig(
             task=args.task,
             feature_name=args.feature_name,
             event_name=args.event_name,
             horizon=args.horizon,
             feature_horizon_mode=args.feature_horizon_mode,
             run_tag=args.run_tag,
-            channels=channels,
+            dataset_format=args.dataset_format,
+            channels=cli_channels,
             model_variant=args.model_variant,
-            n_channels=args.n_channels,
+            n_channels=len(cli_channels),
             seq_len=args.seq_len,
+            input_window_position=args.input_window_position,
             waveform_dir=args.waveform_dir,
             splits_path=args.splits_path,
             target_path=args.target_path,
         )
 
-        output_dir = Path(config.resolve_output_dir())
+        output_dir = Path(cli_config.resolve_output_dir())
         if args.checkpoint:
             checkpoint_path = Path(args.checkpoint)
         else:
@@ -625,6 +843,10 @@ def main():
             print(f"ERROR: Checkpoint not found: {checkpoint_path}")
             print("Has training completed for this target?")
             sys.exit(1)
+
+        saved_config = load_saved_training_config(checkpoint_path)
+        config = train_config_from_saved_and_overrides(saved_config, explicit_overrides)
+        output_dir = checkpoint_path.parent
 
         evaluate_single(
             config=config,

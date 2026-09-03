@@ -27,6 +27,14 @@ Common default model channel order:
 
 - `ABP`, `II`, `PLETH`
 
+Current channel-count convention:
+
+- `patchtst_v1`: `3` channels, `ABP,II,PLETH`
+- `patchtst_v1_5`: `3` channels, `ABP,II,PLETH`
+- `patchtst_v2`: the repo's `4`-channel experimental variant, `II,PLETH,ABP,RESP`
+
+The raw waveform cache stores `4` channels on disk. Current `v1` and `v1.5` training and evaluation results use only the `3`-channel subset above. Treat `v2` as the repo's `4`-channel path unless a run config explicitly overrides `--channels`.
+
 Training uses pre-extracted per-patient `.npy` waveforms with memory-mapped reads through `waveform_baselines/numpy_dataset.py`.
 
 ## Splits and Cohorts

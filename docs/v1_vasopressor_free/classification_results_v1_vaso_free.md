@@ -8,6 +8,7 @@ This page separates the older non-filtered-label `v1` evaluation from the later 
 
 - run tag: `vasopressor_free_v1_events_5m_10m_anchor_horizon_filtered_es`
 - model: `patchtst_v1`
+- waveform inputs: `3` channels, `ABP,II,PLETH`
 - task: single-target event classification
 - cohort: vasopressor-free overlap cohort
 - split file: `outputs/splits/vasopressor_free_splits.json`
@@ -24,6 +25,7 @@ This page separates the older non-filtered-label `v1` evaluation from the later 
 
 - run tag: `vasopressor_free_v1_events_5m_10m_es`
 - model: `patchtst_v1`
+- waveform inputs: `3` channels, `ABP,II,PLETH`
 - task: single-target event classification
 - cohort: vasopressor-free overlap cohort
 - split file: `outputs/splits/vasopressor_free_splits.json`
@@ -40,8 +42,9 @@ This page separates the older non-filtered-label `v1` evaluation from the later 
 ## Notes
 
 - All four evaluations produced finite predictions for every evaluated test sample.
+- These `v1` results use the repo's `3`-channel default model input (`ABP`, `II`, `PLETH`), not the full `4`-channel raw waveform set on disk (`II`, `ABP`, `PLETH`, `RESP`).
 - The prevalence numerators are identical across the filtered and non-filtered tables (`194` positives for `5m`, `437` positives for `10m`); the prevalence shift comes from the much smaller valid denominator after `anchor_horizon_filtered` label filtering.
-- For the filtered test split, the negative counts reconcile as `31,361` baseline negatives minus `27,905` sequential removals plus `194` positives = `3,650` valid examples for `5m`, and `31,141` minus `27,705` plus `437` = `3,873` for `10m`. The full-cohort filtering counts are documented separately in `docs/data_description.md`.
+- For the filtered test split, the negative counts reconcile as `31,361` baseline negatives minus `27,905` sequential removals plus `194` positives = `3,650` valid examples for `5m`, and `31,141` minus `27,705` plus `437` = `3,873` for `10m`. The full-cohort filtering counts are documented separately in `docs/reference/data_description.md`.
 - The filtered dataset is much smaller and much less imbalanced than the non-filtered one, so its metrics are not directly prevalence-matched to the older table.
 - On filtered data, the `5m` model is stronger than the `10m` model on both AUROC and AUPRC.
 - On non-filtered data, both models predicted no positives at the default `0.5` threshold, so default-threshold sensitivity, precision, and F1 were all `0.0`.

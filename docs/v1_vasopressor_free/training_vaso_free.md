@@ -38,6 +38,33 @@ Overlap cohort size:
 
 - shared stats file: `/gpfs/data/eh3828lab/derived_datasets/baselines/waveformBaselines/waveforms/normalization_stats_vasopressor_free_splits.json`
 
+## Completed Target-Normalized Regression Batch (2026-08-28)
+
+These runs keep the current shared waveform normalization and add train-only z-score normalization for each regression target.
+
+- run tag: `vasopressor_free_v1_target_norm_es`
+- model: `patchtst_v1`
+- waveform normalization: enabled with `/gpfs/data/eh3828lab/derived_datasets/baselines/waveformBaselines/waveforms/normalization_stats_vasopressor_free_splits.json`
+- target normalization: enabled via `--normalize-targets`
+- target bundle: `outputs/targets/feature_targets_gap_vasopressor_free.npz`
+- splits: `outputs/splits/vasopressor_free_splits.json`
+- output base: `outputs/patchtst/vasopressor_free_v1_target_norm_es/`
+- shared training env: `/gpfs/data/eh3828lab/derived_datasets/baselines/conda/myenv`
+- first submission jobs `26864294`–`26864306` failed immediately because `slurm/train_patchtst.sh` still referenced the removed `/gpfs/home/dk5565/.conda/envs/physiojepa/bin/python`; remaining jobs `26864307`–`26864319` were cancelled before they started.
+- replacement jobs: `26864363`–`26864388`
+- all `26` target-specific output directories contain `best_model.pt`, `target_normalization.json`, `test_metrics.json`, and `test_predictions.npz`
+- interactive `scripts/eval_patchtst.py --all --output-base outputs/patchtst/vasopressor_free_v1_target_norm_es` attempts on `2026-08-28` failed first on a CLI typo and then on shared-GPU `CUDA out of memory`
+- submitted a dedicated GPU evaluation job on `2026-08-28`: SLURM `26869390` (`ptst_eval_vf_norm`); the job completed and wrote `outputs/patchtst/vasopressor_free_v1_target_norm_es/test_results_summary.json`
+- normalized-target regression results are summarized in `docs/v1_vasopressor_free/regression_results_v1_vaso_free_target_normalized.md`
+- unrelated interactive CPU shell observations are historical only here; use the latest `PROGRESS.md` entry or `squeue` for current queue state
+- Git working-tree status could not be verified on this node because the `git` executable is unavailable; inspect with Git on a login/development node before committing or rebasing
+- focused local verification in the same shared env passed: `/gpfs/data/eh3828lab/derived_datasets/baselines/conda/myenv/bin/python -m unittest tests.test_target_normalization tests.test_eval_patchtst_config_loading` (`10` tests, `OK`)
+
+Next:
+
+- compare the original-unit regression metrics against `docs/v1_vasopressor_free/regression_results_v1_vaso_free_sorted.md`
+- decide which targets should keep simple z-score normalization versus moving to the nonlinear transforms recommended in `docs/v1_vasopressor_free/target_distributions.md`
+
 ## Completed Current Reruns (2026-08-27)
 
 These are the current `v1` jobs.
@@ -115,7 +142,7 @@ Artifacts:
 - `5m` predictions: `outputs/patchtst/vasopressor_free_v1_events_5m_10m_anchor_horizon_filtered_es/event_hypotension_within_5m/test_predictions.npz`
 - `10m` predictions: `outputs/patchtst/vasopressor_free_v1_events_5m_10m_anchor_horizon_filtered_es/event_hypotension_within_10m/test_predictions.npz`
 
-The comparison against the unfiltered `v1` results is summarized in `docs/classification_results_v1_vaso_free.md`.
+The comparison against the unfiltered `v1` results is summarized in `docs/v1_vasopressor_free/classification_results_v1_vaso_free.md`.
 
 ## Completed `pre-v1` Vasopressor-Free Results
 
@@ -178,5 +205,5 @@ Main takeaways:
 - Is hypotension fundamentally weak on this cohort, or mostly limited by label design and event prevalence?
 
 The filtered-negative evaluation is complete and documented in
-`docs/classification_results_v1_vaso_free.md`. The remaining questions are
+`docs/v1_vasopressor_free/classification_results_v1_vaso_free.md`. The remaining questions are
 planned analysis, not completed experiments.

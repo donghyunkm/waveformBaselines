@@ -50,6 +50,11 @@ Current normalization is shared train-split per-channel z-scoring, not per-patie
 - loader: `waveform_baselines/normalization.py`
 - standard stats file example: `normalization_stats_splits.json`
 - vasopressor-free stats file example: `normalization_stats_vasopressor_free_splits.json`
+- optional regression target normalization: `--normalize-targets`
+  - computes target mean/std from the training split only
+  - applies those training-set stats to train, val, and test regression targets
+  - trains on z-scored targets but inverse-transforms predictions back to original units for reported metrics
+  - saves stats to `target_normalization.json` next to the run checkpoints and also stores them in each checkpoint for inference fallback
 
 The dataset now requires the split-specific stats file when `--normalize` is enabled.
 
@@ -61,6 +66,9 @@ Important current behavior:
 
 - one model per target
 - mixed precision forward pass, loss in fp32
+- regression runs with `--normalize-targets` compute loss in normalized target space only
+- evaluation for normalized-target regression runs saves both normalized and original-unit predictions, while summary metrics use original units
+- focused verification passed in `/gpfs/data/eh3828lab/derived_datasets/baselines/conda/myenv` via `python -m unittest tests.test_target_normalization tests.test_eval_patchtst_config_loading`
 - `best_model.pt` tracks best validation loss
 - `latest_model.pt` is saved every epoch for resume
 - `--resume` restores optimizer state, epoch, best validation loss, and early-stopping state
@@ -79,12 +87,14 @@ Checkpoint state also stores `epochs_without_improvement`.
 
 ### `patchtst_v1`
 
+- default waveform inputs: `3` channels, `ABP,II,PLETH`
 - channel-independent temporal encoder
 - no cross-channel attention
 - mean pooling
 
 ### `patchtst_v1_5`
 
+- default waveform inputs: `3` channels, `ABP,II,PLETH`
 - supervised end-to-end adaptation of the PatchTST encoder and attentive classifier from `benmfox/PhysioJEPA`
 - channel-specific grouped-Conv1d tokenizer with zero end-padding
 - shared channel-independent Transformer encoder with rotary Q/K attention and post-norm TST blocks
@@ -95,6 +105,7 @@ Checkpoint state also stores `epochs_without_improvement`.
 
 ### `patchtst_v2`
 
+- default interpretation in this repo: the `4`-channel experimental variant, `II,PLETH,ABP,RESP`
 - experimental variant
 - local cross-channel fusion
 - optional attention pooling

@@ -744,10 +744,18 @@ def save_target_bundle(
         "anchor_patient_ids": anchors["patient_id"].astype(str).to_numpy(),
         "anchor_times": anchors["anchor_time"].to_numpy(dtype=np.float64),
     }
+    if "anchor_id" in anchors.columns:
+        arrays["anchor_ids"] = anchors["anchor_id"].to_numpy(dtype=np.int64)
+    if "segment_id" in anchors.columns:
+        arrays["segment_ids"] = anchors["segment_id"].astype(str).to_numpy()
+    if "seg_name" in anchors.columns:
+        arrays["segment_names"] = anchors["seg_name"].astype(str).to_numpy()
     if "input_start_time" in anchors.columns:
         arrays["input_start_times"] = anchors["input_start_time"].to_numpy(dtype=np.float64)
     if "input_end_time" in anchors.columns:
         arrays["input_end_times"] = anchors["input_end_time"].to_numpy(dtype=np.float64)
+    if "split_label" in anchors.columns:
+        arrays["split_labels"] = anchors["split_label"].astype(str).to_numpy()
     if feature_targets is not None and feature_mask is not None:
         arrays["feature_targets"] = feature_targets
         arrays["feature_mask"] = feature_mask
